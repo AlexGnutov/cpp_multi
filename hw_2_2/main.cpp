@@ -9,7 +9,6 @@
 #include <thread>
 #include <mutex>
 #include <map>
-#include <condition_variable>
 
 using namespace std::chrono_literals;
 
@@ -21,9 +20,6 @@ const double PROGRESS_INC = 0.5;    ///< Инкремент прогресса.
 const double RACE_SCALE = 0.1;      ///< Коэффециент расхождения потоков во времени.
 const int CONSOLE_MS = 100;         ///< Интервал обновления консоли.
 
-std::condition_variable logged;     ///< Условие: все данные выведены в консоль.
-std::mutex mux;                     ///< Мутекс завершения вывода.
-bool is_logged;                     ///< Флаг: все данные выведены в консоль.
 
 //! Статусы состояния потока.
 enum class Status {
@@ -39,7 +35,7 @@ std::string status_to_string(Status s) {
         case Status::init: return "init";
         case Status::working: return "working";
         case Status::finished: return "finished";
-        case Status::error: return "error";
+        case Status::error: return "error   ";
     default: return "unknown";
     }
 }
@@ -49,6 +45,7 @@ struct ProcessData {
     int process_id;
     double progress = 0.0;
     Status status = Status::init;
+    double elapsed = 0.0;
 };
 
 
@@ -57,68 +54,49 @@ class StatusInfo {
 public:
 
     // Обновляет статус по переданным данным процесса.
-    void update_status(int process_id, Status status, const double& progress) {
+    void update_status(int process_id, Status status, const double& progress, const double& elapsed) {
         std::lock_guard<std::mutex> lf(mux);
-        process_data[process_id] = ProcessData{process_id, progress, status};
-    }
 
-    // Выводит данные о процессах в консоль.
-    void print_output() {
-        std::lock_guard<std::mutex> lf(mux);
-        system("clear");
-        for (auto &pd : process_data) {
-            std::cout << std::left << std::setw(5) << pd.second.process_id
-                      << std::left << std::setw(15) << get_percent_string(pd.second.progress)
-                      << std::left << std::setw(10) << status_to_string(pd.second.status)
-                      << std::endl;
+        int y = process_id;
+
+        if (process_data.count(process_id) != 1) {
+            process_data[process_id] = ProcessData{process_id, progress, status};
+            progress_bar[process_id] = 0;
+            print_x_y(process_id, 0, std::to_string(process_id));
+            print_x_y(process_id, 26, status_to_string(status));
         }
+
+        auto data = process_data[process_id];
+
+        if (data.status != status) {
+            print_x_y(process_id, 26, status_to_string(status));
+        }
+
+        if (status != Status::error) {
+            int done = progress / 10;
+            if (done > progress_bar[process_id]) {
+                print_x_y(process_id, 12 + done, "*");
+                progress_bar[process_id] = done;
+            }
+        } else {
+            print_x_y(process_id, 12, " ----------");
+        }
+
+        if (elapsed != 0) {
+            print_x_y(process_id, 38, std::to_string(elapsed) + " ms");
+        }
+
+        process_data[process_id] = ProcessData{process_id, progress, status, elapsed};
     }
 
-    // Формирует строку из звёздочек.
-    std::string get_percent_string(const double& progress) {
-        int num = progress * 0.1;
-        return std::string(num, '*');
-    }
-
-    // Устанавливает флаг: все процессы завершены.
-    void set_complete() {
-        complete.store(true);
-    }
-
-    // Возвращает значение флага "все процессы завершены".
-    bool is_complete() {
-        return complete.load();
+    void print_x_y(int y, int x, const std::string& status) {
+        std::cout << "\033[" << y << ';' << x << 'H' << status << std::flush;
     }
 
 private:
-
     std::mutex mux;
+    std::map<int,int> progress_bar;
     std::map<int, ProcessData> process_data = {};
-    std::atomic<bool> complete{false};
-};
-
-
-//! Класс для печати в консоль.
-class ConsoleWriter {
-public:
-    ConsoleWriter(StatusInfo *si):si(si){}
-
-    void run() {
-        std::thread tr([this]() {
-            while (!si->is_complete()) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(CONSOLE_MS));
-                this->si->print_output();
-            }
-
-            std::lock_guard<std::mutex> lock(mux);
-            is_logged = true;
-            logged.notify_one();
-
-        });
-        tr.detach();
-    };
-
-    StatusInfo *si;
 };
 
 
@@ -139,28 +117,28 @@ public:
         for (auto& t : thrds) {
             t.join();
         }
-
-        sp->set_complete();
-
-        std::unique_lock<std::mutex> lock(mux);
-        logged.wait(lock, [] {return is_logged; });
     }
 
     void loop_method(int process_id, int millisec) {
         double progress = 0;
 
+        std::chrono::steady_clock::time_point beg = std::chrono::steady_clock::now();
+
         while (progress != 100.0) {
             std::this_thread::sleep_for(std::chrono::milliseconds(millisec));
             progress += PROGRESS_INC;
-            sp->update_status(process_id, Status::working, progress);
+            sp->update_status(process_id, Status::working, progress, 0.0);
 
             if (progress > LOOSER_MOMENT && process_id == LOOSER_THREAD_ID) {
-                sp->update_status(process_id, Status::error, 0.0);
+                sp->update_status(process_id, Status::error, 0.0, 0.0);
                 return;
             }
         }
 
-        sp->update_status(process_id, Status::finished, 100.0);
+        std::chrono::steady_clock::time_point end = std::chrono::steady_clock::now();
+        double elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(end - beg).count();
+
+        sp->update_status(process_id, Status::finished, 100.0, elapsed);
         return;
     }
 
@@ -172,11 +150,12 @@ private:
 int main() {
 
     StatusInfo sp;
-    ConsoleWriter cw(&sp);
     Runner r(&sp);
 
-    cw.run();
+    system("clear");
+
     r.run(THREADS);
 
+    std::cout << std::endl;
     return 0;
 }
