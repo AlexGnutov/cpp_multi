@@ -405,3 +405,4 @@ cmake-build-release
 catch2
 
 .idea
+build*
